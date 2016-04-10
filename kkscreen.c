@@ -49,7 +49,7 @@
 typedef struct Inbound Inbound;
 typedef struct Screen Screen;
 
-static char const *endmsg = "\r\nuser process terminated\r\n";
+static char const *endmsg = "\r\nkkscreen: user process terminated\r\n";
 static char do_list_filter_param[24];
 static int volatile gotsigwinch;
 struct sockaddr_un crsockaddr;
@@ -217,7 +217,6 @@ static int do_attach (char *name, char endch)
      * Shuttle data back and forth.
      */
     nfds = sockfd + 1;
-    if (nfds < sockfd + 1) nfds = sockfd + 1;
     while (TRUE) {
         FD_ZERO (&readmask);
         FD_SET (STDIN_FILENO, &readmask);
@@ -350,6 +349,7 @@ struct Screen {
     int curheight;          // current height set
     int insert;             // where to insert next in buf[]
     int wrapped;            // bool indicating 'insert' has wrapped
+    int waitfds[2];         // pipe to wait for first attach
     char buf[16000];        // last 16000 chars from user process
 };
 
@@ -357,13 +357,17 @@ struct Screen {
 static int cmd_create (int argc, char **argv)
 {
     char *name;
-    int command, exstat, oldmask, opt_attach, opt_force, pid, rc, uid;
+    int command, exstat, oldmask, opt_daemon, opt_force, opt_wait, pid, rc, uid;
     pthread_t inbound_thread;
     Screen screen;
     struct winsize winsz;
 
     memset (&screen, 0, sizeof screen);
     pthread_mutex_init (&screen.mutex, NULL);
+    screen.lisfd = -1;
+    screen.ptyfd = -1;
+    screen.waitfds[0] = -1;
+    screen.waitfds[1] = -1;
 
     if (!isatty (STDOUT_FILENO) || (ioctl (STDOUT_FILENO, TIOCGWINSZ, &winsz) < 0)) {
         memset (&winsz, 0, sizeof winsz);
@@ -375,12 +379,13 @@ static int cmd_create (int argc, char **argv)
      * Decode command arguments.
      */
     name       = NULL;
-    opt_attach = FALSE;
+    opt_daemon = FALSE;
     opt_force  = FALSE;
+    opt_wait   = FALSE;
     for (command = 0; ++ command < argc;) {
         if (argv[command][0] == '-') {
-            if (strcasecmp (argv[command], "-attach") == 0) {
-                opt_attach = TRUE;
+            if (strcasecmp (argv[command], "-daemon") == 0) {
+                opt_daemon = TRUE;
                 continue;
             }
             if (strcasecmp (argv[command], "-force") == 0) {
@@ -390,6 +395,10 @@ static int cmd_create (int argc, char **argv)
             if (strcasecmp (argv[command], "-height") == 0) {
                 if (++ command >= argc) goto usage;
                 winsz.ws_row = atoi (argv[command]);
+                continue;
+            }
+            if (strcasecmp (argv[command], "-wait") == 0) {
+                opt_wait = TRUE;
                 continue;
             }
             if (strcasecmp (argv[command], "-width") == 0) {
@@ -458,35 +467,11 @@ bindit:
     }
 
     /*
-     * Delete socket if aborted via some signal.
+     * If -wait, set up synchronization pipes.
+     * User process waits for something to be written to pipe before execing.
+     * Server process writes to pipe when it has received first inbound connection.
      */
-    if (signal (SIGHUP,  handle_abortsig) == SIG_ERR) abort ();
-    if (signal (SIGINT,  handle_abortsig) == SIG_ERR) abort ();
-    if (signal (SIGQUIT, handle_abortsig) == SIG_ERR) abort ();
-    if (signal (SIGTERM, handle_abortsig) == SIG_ERR) abort ();
-    if (signal (SIGUSR1, SIG_IGN) == SIG_ERR) abort ();
-    if (signal (SIGUSR2, SIG_IGN) == SIG_ERR) abort ();
-
-    /*
-     * If -attach, fork thread to do attach before starting user process
-     * so as to be sure to get all output from user process.
-     * Wait for the corresponding inbound connection before starting
-     * user process so we don't miss any of its output.
-     */
-    if (opt_attach) {
-        pid = fork ();
-        if (pid < 0) {
-            fprintf (stderr, "kkscreen: fork() error: %s\n", strerror (errno));
-            rc = 2;
-            goto done1;
-        }
-        if (pid == 0) {
-            close (screen.lisfd);
-            exit (do_attach (name, ENDCHAR));
-        }
-        rc = accept_inbound (&screen);
-        if (rc != 0) goto done1;
-    }
+    if (opt_wait && (pipe (screen.waitfds) < 0)) abort ();
 
     /*
      * Create pseudo terminal and fork process to run user command.
@@ -500,10 +485,34 @@ bindit:
         goto done1;
     }
     if (pid == 0) {
+        close (screen.waitfds[1]);
+        while ((read (screen.waitfds[0], &exstat, 1) < 0) && (errno == EINTR)) { }
+        close (screen.waitfds[0]);
         execvp (argv[command], argv + command);
         fprintf (stderr, "kkscreen: execvp(%s) error: %s\n", argv[command], strerror (errno));
         exit (-1);
     }
+    close (screen.waitfds[0]);
+    screen.waitfds[0] = -1;
+
+    /*
+     * Maybe detach to run the server in a background process.
+     */
+    if (opt_daemon && (daemon (1, 0) < 0)) {
+        fprintf (stderr, "kkscreen: daemon() error: %s\n", strerror (errno));
+        rc = 2;
+        goto done3;
+    }
+
+    /*
+     * Delete socket if aborted via some signal.
+     */
+    if (signal (SIGHUP,  handle_abortsig) == SIG_ERR) abort ();
+    if (signal (SIGINT,  handle_abortsig) == SIG_ERR) abort ();
+    if (signal (SIGQUIT, handle_abortsig) == SIG_ERR) abort ();
+    if (signal (SIGTERM, handle_abortsig) == SIG_ERR) abort ();
+    if (signal (SIGUSR1, SIG_IGN) == SIG_ERR) abort ();
+    if (signal (SIGUSR2, SIG_IGN) == SIG_ERR) abort ();
 
     /*
      * This thread accepts new inbound connections.
@@ -512,7 +521,7 @@ bindit:
     if (rc != 0) {
         fprintf (stderr, "kkscreen: pthread_create() error: %s\n", strerror (rc));
         rc = 2;
-        goto done1;
+        goto done3;
     }
 
     /*
@@ -524,10 +533,13 @@ bindit:
     /*
      * Pass on process' exit status.
      */
-    if (rc == 0) {
-        if (waitpid (pid, &exstat, 0) > 0) rc = exstat;
+    if ((rc == 0) && (waitpid (pid, &exstat, 0) > 0)) {
+        rc = exstat;
+        goto done1;
     }
 
+done3:
+    if (pid > 0) kill (pid, SIGKILL);
 done1:
     unlink (crsockaddr.sun_path);
 done2:
@@ -535,7 +547,12 @@ done2:
     return rc;
 
 usage:
-    fprintf (stderr, "usage: kkscreen create [-attach] [-force] [-height <height>] [-width <width>] <sessionname> <command>...\n");
+    fprintf (stderr, "usage: kkscreen create [-daemon] [-force] [-height <height>] [-wait] [-width <width>] <sessionname> <command>...\n");
+    fprintf (stderr, "        -daemon : run server as a daemon\n");
+    fprintf (stderr, "         -force : kill any existing same-named session\n");
+    fprintf (stderr, "        -height : set pseudo-tty height\n");
+    fprintf (stderr, "          -wait : user process waits for first attach\n");
+    fprintf (stderr, "         -width : set pseudo-tty width\n");
     return 1;
 }
 
@@ -623,6 +640,7 @@ static int accept_inbound (Screen *screen)
      * Wait for an inbound connection.
      */
     memset (&sockaddr, 0, sizeof sockaddr);
+    sockaddrlen = sizeof sockaddr;
     confd = accept (screen->lisfd, (void *)&sockaddr, &sockaddrlen);
     if (confd < 0) {
         fprintf (stderr, "kkscreen: accept() error: %s\n", strerror (errno));
@@ -747,6 +765,15 @@ static void *connection_thread (void *inboundv)
      */
     inbound->next = screen->inbounds;
     screen->inbounds = inbound;
+
+    /*
+     * Maybe user process is blocked until first attach completes.
+     */
+    if (screen->waitfds[1] >= 0) {
+        close (screen->waitfds[1]);
+        screen->waitfds[1] = -1;
+    }
+
     pthread_mutex_unlock (&screen->mutex);
 
     /*
