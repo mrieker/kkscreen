@@ -55,7 +55,7 @@ static int volatile gotsigwinch;
 struct sockaddr_un crsockaddr;
 
 static int cmd_attach (int argc, char **argv);
-static int do_attach (char *name, char endch);
+static int do_attach (char *name, char endch, char *until);
 static void handle_sigwinch (int sig);
 static void update_winsize (int sockfd);
 static int cmd_create (int argc, char **argv);
@@ -109,12 +109,14 @@ usage:
 
 static int cmd_attach (int argc, char **argv)
 {
-    char endch, *name, *p;
+    char endch, *name, *p, *until;
     int i;
     long chrcode;
 
     endch = ENDCHAR;
     name = NULL;
+    until = NULL;
+
     for (i = 0; ++ i < argc;) {
         if (argv[i][0] == '-') {
             if (strcasecmp (argv[i], "-endchar") == 0) {
@@ -137,6 +139,14 @@ static int cmd_attach (int argc, char **argv)
                 fprintf (stderr, "kkscreen: bad endchar %s\n", argv[i]);
                 goto usage;
             }
+            if (strcasecmp (argv[i], "-until") == 0) {
+                if (++ i >= argc) {
+                    fprintf (stderr, "kkscreen: missing until arg\n");
+                    goto usage;
+                }
+                until = argv[i];
+                continue;
+            }
             fprintf (stderr, "kkscreen: unknown option %s\n", argv[i]);
             goto usage;
         }
@@ -151,10 +161,10 @@ static int cmd_attach (int argc, char **argv)
         goto usage;
     }
 
-    return do_attach (name, endch);
+    return do_attach (name, endch, until);
 
 usage:
-    fprintf (stderr, "usage: kkscreen attach [-endchar <ctrlchar>] <sessionname>\n");
+    fprintf (stderr, "usage: kkscreen attach [-endchar <ctrlchar>] [-until <string>] <sessionname>\n");
     fprintf (stderr, "       -endchar can have a single letter (or anything in ascii 0x40-0x7F)\n");
     fprintf (stderr, "           to indicate the corresponding control character\n");
     fprintf (stderr, "           eg, -endchar e  means control-e\n");
@@ -162,16 +172,19 @@ usage:
     fprintf (stderr, "           to indicate that character\n");
     fprintf (stderr, "           eg, -endchar 0x7E means ~\n");
     fprintf (stderr, "       default for -endchar is ctrl-%c\n", ENDCHAR + '@');
+    fprintf (stderr, "       -until will terminate the attach when the string is seen\n");
     return 1;
 }
 
-static int do_attach (char *name, char endch)
+static int do_attach (char *name, char endch, char *until)
 {
-    char buf[4096];
+    char buf[4096], *p, screenlinebuf[4096];
     fd_set readmask;
-    int len, nfds, ofs, rc, sockfd;
+    int len, nfds, ofs, overage, rc, screenlinelen, sockfd;
     sigset_t newsigmask, oldsigmask;
     struct termios newtermios, oldtermios;
+
+    screenlinelen = 0;
 
     /*
      * Open connection to server.
@@ -273,6 +286,10 @@ static int do_attach (char *name, char endch)
          * Get user process data from link and display on local screen.
          */
         if (FD_ISSET (sockfd, &readmask)) {
+
+            /*
+             * Read from user process' output pipe.
+             */
             rc = read (sockfd, buf, sizeof buf);
             if (rc <= 0) {
                 if (rc < 0) {
@@ -281,10 +298,56 @@ static int do_attach (char *name, char endch)
                 }
                 goto done1;
             }
+
+            /*
+             * Send it to our stdout.
+             */
             if (!writepipe (STDOUT_FILENO, buf, rc)) {
                 fprintf (stderr, "kkscreen: write() stdout error: %s\n", strerror (errno));
                 rc = 2;
                 goto done1;
+            }
+
+            /*
+             * See if we are looking for an 'until' string.
+             */
+            if (until != NULL) {
+
+                /*
+                 * Ok, accumulate in latest screen line buffer.
+                 */
+                overage = screenlinelen + rc - sizeof screenlinebuf;
+                if (overage > 0) {
+                    screenlinelen -= overage;
+                    if (screenlinelen < 0) abort ();
+                    memmove (screenlinebuf, screenlinebuf + overage, screenlinelen);
+                }
+                memcpy (screenlinebuf + screenlinelen, buf, rc);
+                screenlinelen += rc;
+
+                /*
+                 * See if we now have a full line (indicated by a \n in buffer).
+                 */
+                p = memchr (buf, '\n', rc);
+                if (p != NULL) {
+
+                    /*
+                     * Nul terminate the line we have and see if it matches the until.
+                     */
+                    p += (screenlinebuf + screenlinelen) - (buf + rc);
+                    *p = 0;
+                    if (strstr (screenlinebuf, until) != NULL) {
+                        writepipe (STDOUT_FILENO, "\r\n", 2);
+                        rc = 0;
+                        goto done1;
+                    }
+
+                    /*
+                     * Doesn't match, strip line from line buffer and keep going.
+                     */
+                    screenlinelen -= ++ p - screenlinebuf;
+                    memmove (screenlinebuf, p, screenlinelen);
+                }
             }
         }
     }
