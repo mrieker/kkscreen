@@ -1026,6 +1026,8 @@ static int cmd_inject (int argc, char **argv)
     flushpipereads (sockfd);
     while (read (sockfd, ccbuf, sizeof ccbuf) > 0) { }
 
+    rc = 0;
+
 done:
     close (sockfd);
     return rc;
