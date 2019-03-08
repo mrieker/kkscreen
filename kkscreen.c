@@ -55,7 +55,7 @@ static int volatile gotsigwinch;
 struct sockaddr_un crsockaddr;
 
 static int cmd_attach (int argc, char **argv);
-static int do_attach (char *name, char endch, char *until);
+static int do_attach (char *name, char endch, char *until, FILE *logfile);
 static void handle_sigwinch (int sig);
 static void update_winsize (int sockfd);
 static int cmd_create (int argc, char **argv);
@@ -110,10 +110,12 @@ usage:
 static int cmd_attach (int argc, char **argv)
 {
     char endch, *name, *p, *until;
+    FILE *logfile;
     int i;
     long chrcode;
 
     endch = ENDCHAR;
+    logfile = NULL;
     name = NULL;
     until = NULL;
 
@@ -139,6 +141,18 @@ static int cmd_attach (int argc, char **argv)
                 fprintf (stderr, "kkscreen: bad endchar %s\n", argv[i]);
                 goto usage;
             }
+            if (strcasecmp (argv[i], "-logfile") == 0) {
+                if (++ i >= argc) {
+                    fprintf (stderr, "kkscreen: missing logfile arg\n");
+                    goto usage;
+                }
+                logfile = fopen (argv[i], "w");
+                if (logfile == NULL) {
+                    fprintf (stderr, "kkscreen: eeror creating logfile %s: %s\n", argv[i], strerror (errno));
+                    return -1;
+                }
+                continue;
+            }
             if (strcasecmp (argv[i], "-until") == 0) {
                 if (++ i >= argc) {
                     fprintf (stderr, "kkscreen: missing until arg\n");
@@ -161,10 +175,10 @@ static int cmd_attach (int argc, char **argv)
         goto usage;
     }
 
-    return do_attach (name, endch, until);
+    return do_attach (name, endch, until, logfile);
 
 usage:
-    fprintf (stderr, "usage: kkscreen attach [-endchar <ctrlchar>] [-until <string>] <sessionname>\n");
+    fprintf (stderr, "usage: kkscreen attach [-endchar <ctrlchar>] [-logfile <filename>] [-until <string>] <sessionname>\n");
     fprintf (stderr, "       -endchar can have a single letter (or anything in ascii 0x40-0x7F)\n");
     fprintf (stderr, "           to indicate the corresponding control character\n");
     fprintf (stderr, "           eg, -endchar e  means control-e\n");
@@ -176,7 +190,7 @@ usage:
     return 1;
 }
 
-static int do_attach (char *name, char endch, char *until)
+static int do_attach (char *name, char endch, char *until, FILE *logfile)
 {
     char buf[4096], *p, screenlinebuf[4096];
     fd_set readmask;
@@ -309,6 +323,13 @@ static int do_attach (char *name, char endch, char *until)
             }
 
             /*
+             * Maybe write to log file.
+             */
+            if (logfile != NULL) {
+                fwrite (buf, rc, 1, logfile);
+            }
+
+            /*
              * See if we are looking for an 'until' string.
              */
             if (until != NULL) {
@@ -359,6 +380,7 @@ done1:
     }
 done2:
     close (sockfd);
+    if (logfile != NULL) fclose (logfile);
     return rc;
 }
 
