@@ -1188,26 +1188,28 @@ static void do_list (int myuid)
 
         memset (&sockaddr, 0, sizeof sockaddr);
         sockaddr.sun_family = AF_UNIX;
-        snprintf (sockaddr.sun_path, sizeof sockaddr.sun_path, "/tmp/%s", name);
+        if (strlen (name) + 6 < sizeof sockaddr.sun_path) {
+            snprintf (sockaddr.sun_path, sizeof sockaddr.sun_path, "/tmp/%s", name);
 
-        if (stat (sockaddr.sun_path, &statbuf) >= 0) {
-            status = "dead";
-            sockfd = socket (AF_UNIX, SOCK_STREAM, 0);
-            if (sockfd >= 0) {
-                if (connect (sockfd, (void *)&sockaddr, sizeof sockaddr) >= 0) {
-                    shutdown (sockfd, SHUT_WR);
-                    while (read (sockfd, buf, sizeof buf) > 0) { }
-                    status = "live";
+            if (stat (sockaddr.sun_path, &statbuf) >= 0) {
+                status = "dead";
+                sockfd = socket (AF_UNIX, SOCK_STREAM, 0);
+                if (sockfd >= 0) {
+                    if (connect (sockfd, (void *)&sockaddr, sizeof sockaddr) >= 0) {
+                        shutdown (sockfd, SHUT_WR);
+                        while (read (sockfd, buf, sizeof buf) > 0) { }
+                        status = "live";
+                    }
+                    close (sockfd);
                 }
-                close (sockfd);
-            }
 
-            lcl = *localtime (&statbuf.st_mtime);
-            printf ("  %04d-%02d-%02d %02d:%02d:%02d  %s  %s/%s\n", 
-                    lcl.tm_year + 1900, lcl.tm_mon + 1, lcl.tm_mday,
-                    lcl.tm_hour, lcl.tm_min, lcl.tm_sec,
-                    status, uidstr, name + strlen (do_list_filter_param));
-            shown = TRUE;
+                lcl = *localtime (&statbuf.st_mtime);
+                printf ("  %04d-%02d-%02d %02d:%02d:%02d  %s  %s/%s\n", 
+                        lcl.tm_year + 1900, lcl.tm_mon + 1, lcl.tm_mday,
+                        lcl.tm_hour, lcl.tm_min, lcl.tm_sec,
+                        status, uidstr, name + strlen (do_list_filter_param));
+                shown = TRUE;
+            }
         }
         free (namelist[i]);
     }
